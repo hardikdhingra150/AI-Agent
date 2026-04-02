@@ -6,6 +6,8 @@ from agent.core import LifeOSAgent
 from agent.memory import MemoryManager
 from google.cloud.firestore_v1.base_query import FieldFilter
 from dotenv import load_dotenv
+from scheduler import start_scheduler
+from contextlib import asynccontextmanager
 import os
 
 load_dotenv()
@@ -19,6 +21,15 @@ app.add_middleware(CORSMiddleware,
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+#scheduler
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = start_scheduler()
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(title="LifeOS API", lifespan=lifespan)
 
 # ─── Request Models ────────────────────────────────────────────────────────────
 

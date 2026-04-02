@@ -90,6 +90,12 @@ def add_user_goal(title_and_domain: str) -> str:
     domain = parts[1].strip() if len(parts) > 1 else "general"
     return f"__ADD_GOAL__{title}|{domain}"
 
+@tool
+def create_calendar_event(event_details: str) -> str:
+    """Create a Google Calendar event.
+    Input: 'title | YYYY-MM-DD | HH:MM | duration_minutes'
+    Example: 'Deep work session | 2026-04-03 | 10:00 | 120'"""
+
 
 @tool
 def complete_goal(goal_title: str) -> str:
