@@ -1,35 +1,47 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from contextlib import asynccontextmanager
 from agent.core import LifeOSAgent
 from agent.memory import MemoryManager
 from google.cloud.firestore_v1.base_query import FieldFilter
-from dotenv import load_dotenv
+from firebase_admin import firestore
 from scheduler import start_scheduler
-from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 import os
 
 load_dotenv()
 
-app = FastAPI(title="LifeOS API", version="1.0.0")
 
-app.add_middleware(CORSMiddleware,
-    allow_origins=["http://localhost:5173",
-                   "http://localhost:3000",
-                   "https://your-app.web.app"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+# ─── Lifespan (Scheduler) ──────────────────────────────────────────────────────
 
-#scheduler
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler = start_scheduler()
+    scheduler = start_scheduler()      # starts on boot
     yield
-    scheduler.shutdown()
+    scheduler.shutdown()               # clean stop on exit
 
-app = FastAPI(title="LifeOS API", lifespan=lifespan)
+
+# ─── App (ONE definition only) ────────────────────────────────────────────────
+
+app = FastAPI(
+    title="LifeOS API",
+    version="1.0.0",
+    lifespan=lifespan                  # scheduler hooked in here
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://your-app.web.app"
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True
+)
+
 
 # ─── Request Models ────────────────────────────────────────────────────────────
 
@@ -67,6 +79,7 @@ class MemoryUpdateRequest(BaseModel):
     key: str
     value: str
 
+
 # ─── Core Routes ───────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -86,6 +99,12 @@ async def get_context(uid: str):
     if not ctx:
         raise HTTPException(status_code=404, detail="User not found")
     return ctx
+
+@app.get("/stats/{uid}")
+async def get_stats(uid: str):
+    mm = MemoryManager(uid)
+    return mm.get_stats()
+
 
 # ─── Chat ──────────────────────────────────────────────────────────────────────
 
@@ -107,6 +126,16 @@ async def get_briefing(uid: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/weekly/{uid}")
+async def get_weekly_review(uid: str):
+    try:
+        agent = LifeOSAgent(uid)
+        review = agent.generate_weekly_review()
+        return {"review": review}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── Goals ─────────────────────────────────────────────────────────────────────
 
 @app.post("/goal")
@@ -118,8 +147,6 @@ async def add_goal(req: GoalRequest):
 @app.get("/goals/{uid}")
 async def get_goals(uid: str):
     mm = MemoryManager(uid)
-    from firebase_admin import firestore
-    from google.cloud.firestore_v1.base_query import FieldFilter
     goals = [g.to_dict() for g in
              mm.ref.collection("goals")
              .where(filter=FieldFilter("status", "==", "active"))
@@ -131,7 +158,6 @@ async def update_goal_progress(req: ProgressRequest):
     if not 0 <= req.progress <= 100:
         raise HTTPException(status_code=400, detail="Progress must be 0-100")
     mm = MemoryManager(req.uid)
-    from google.cloud.firestore_v1.base_query import FieldFilter
     goals = mm.ref.collection("goals")\
                   .where(filter=FieldFilter("title", "==", req.goal_title))\
                   .get()
@@ -143,7 +169,6 @@ async def update_goal_progress(req: ProgressRequest):
 @app.delete("/goal/{uid}/{goal_title}")
 async def complete_goal(uid: str, goal_title: str):
     mm = MemoryManager(uid)
-    from google.cloud.firestore_v1.base_query import FieldFilter
     goals = mm.ref.collection("goals")\
                   .where(filter=FieldFilter("title", "==", goal_title))\
                   .get()
@@ -151,6 +176,7 @@ async def complete_goal(uid: str, goal_title: str):
         raise HTTPException(status_code=404, detail="Goal not found")
     goals[0].reference.update({"status": "completed"})
     return {"status": "ok", "message": f"Goal '{goal_title}' marked complete 🎉"}
+
 
 # ─── Habits ────────────────────────────────────────────────────────────────────
 
@@ -171,9 +197,12 @@ async def log_habit(req: LogHabitRequest):
     mm = MemoryManager(req.uid)
     success = mm.log_habit(req.habit_name)
     if not success:
-        raise HTTPException(status_code=404,
-                            detail=f"Habit '{req.habit_name}' not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Habit '{req.habit_name}' not found"
+        )
     return {"status": "ok", "message": f"Logged '{req.habit_name}' 🔥"}
+
 
 # ─── Memory ────────────────────────────────────────────────────────────────────
 
@@ -183,12 +212,12 @@ async def update_memory(req: MemoryUpdateRequest):
     mm.update_memory(req.key, req.value)
     return {"status": "ok", "key": req.key, "value": req.value}
 
+
 # ─── History ───────────────────────────────────────────────────────────────────
 
 @app.get("/history/{uid}")
 async def get_history(uid: str, limit: int = 20):
     mm = MemoryManager(uid)
-    from firebase_admin import firestore
     history = [i.to_dict() for i in
                mm.ref.collection("interactions")
                .order_by("timestamp",
@@ -199,7 +228,30 @@ async def get_history(uid: str, limit: int = 20):
 @app.delete("/history/{uid}")
 async def clear_history(uid: str):
     mm = MemoryManager(uid)
-    interactions = mm.ref.collection("interactions").stream()
-    for doc in interactions:
+    for doc in mm.ref.collection("interactions").stream():
         doc.reference.delete()
     return {"status": "ok", "message": "History cleared"}
+
+
+# ─── Scheduler Test Endpoints ─────────────────────────────────────────────────
+
+@app.post("/test/briefing")
+async def test_briefing():
+    """Manually trigger morning briefings for all users — testing only."""
+    from scheduler import send_morning_briefings
+    send_morning_briefings()
+    return {"status": "ok", "message": "Briefings sent to all users"}
+
+@app.post("/test/nudge")
+async def test_nudge():
+    """Manually trigger habit nudges for all users — testing only."""
+    from scheduler import send_habit_nudges
+    send_habit_nudges()
+    return {"status": "ok", "message": "Nudges sent to all users"}
+
+@app.post("/test/weekly")
+async def test_weekly():
+    """Manually trigger weekly reviews for all users — testing only."""
+    from scheduler import send_weekly_reviews
+    send_weekly_reviews()
+    return {"status": "ok", "message": "Weekly reviews sent"}
